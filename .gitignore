@@ -6,3 +6,5 @@ recovery_state.json
 venv/
 node_modules/
 .DS_Store
+
+recoverIQ/

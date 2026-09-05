@@ -8,10 +8,10 @@ It scores revenue at risk, recommends a bounded intervention, validates that rec
 ## Run locally
 
 ```powershell
-python app.py
+python -m uvicorn app:app --reload
 ```
 
-Then open <http://localhost:8000>.
+Then open <http://localhost:8000>. API documentation is available at <http://localhost:8000/docs>.
 
 ## Import your own failed-payment data
 
@@ -49,7 +49,7 @@ Invoke-RestMethod http://localhost:8000/api/execute -Method Post -ContentType ap
 
 Repeating the same request returns the same provider result and marks it as a duplicate, demonstrating idempotent behavior. Blocked payments return `409` and cannot bypass the policy layer.
 
-The MVP is intentionally dependency-free. It uses a synthetic batch and simulated payment outcomes so the demo is safe to run without production credentials.
+The MVP keeps the frontend dependency-free and uses FastAPI for a typed backend API. It uses a synthetic batch and simulated payment outcomes so the demo is safe to run without production credentials.
 
 ## Agent loop
 

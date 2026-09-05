@@ -11,6 +11,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 from providers import PROVIDER
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
+import uvicorn
 
 ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "recovery_state.json"
@@ -99,14 +103,14 @@ def evaluate(transactions):
         if outcome != "NOT_ATTEMPTED":
             audit.append({"timestamp": now(), "payment_id": t["id"], "event": "EXECUTION", "action": action, "policy": status, "reason": outcome})
     at_risk = sum(t["amount"] for t in transactions)
-    return {"transactions": rows, "audit": audit, "metrics": {"at_risk": at_risk, "recovered": recovered, "baseline": baseline, "recovery_rate": round(recovered / at_risk * 100, 1), "allowed": sum(r["policy"] == "ALLOWED" for r in rows), "escalated": sum(r["action"] == "ESCALATE" for r in rows)}}
+    return {"transactions": rows, "audit": audit, "metrics": {"at_risk": at_risk, "recovered": recovered, "baseline": baseline, "potentially_recoverable": sum(r["expected_value"] for r in rows if r["policy"] == "ALLOWED"), "recovery_rate": round(recovered / at_risk * 100, 1), "allowed": sum(r["policy"] == "ALLOWED" for r in rows), "escalated": sum(r["action"] == "ESCALATE" for r in rows), "action_counts": {action: sum(r["action"] == action for r in rows) for action in {"RETRY", "NUDGE", "WAIT", "ESCALATE"}}}}
 
 
 def refresh_metrics(state):
     rows = state["transactions"]
     at_risk = sum(r["amount"] for r in rows)
     recovered = sum(r["amount"] for r in rows if r["outcome"] == "RECOVERED")
-    state["metrics"].update({"at_risk": at_risk, "recovered": recovered, "recovery_rate": round(recovered / at_risk * 100, 1) if at_risk else 0, "allowed": sum(r["policy"] == "ALLOWED" for r in rows), "escalated": sum(r["action"] == "ESCALATE" for r in rows)})
+    state["metrics"].update({"at_risk": at_risk, "recovered": recovered, "recovery_rate": round(recovered / at_risk * 100, 1) if at_risk else 0, "allowed": sum(r["policy"] == "ALLOWED" for r in rows), "escalated": sum(r["action"] == "ESCALATE" for r in rows), "potentially_recoverable": sum(r.get("expected_value", 0) for r in rows if r["policy"] == "ALLOWED")})
     return state
 
 
@@ -126,110 +130,119 @@ def load_state():
 DATA = load_state()
 
 
-class Handler(BaseHTTPRequestHandler):
-    def send_json(self, payload, status=200):
-        body = json.dumps(payload).encode()
-        self.send_response(status); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+class ExecuteRequest(BaseModel):
+    payment_id: str
+    mode: str = "simulation"
+    idempotency_key: str
 
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path == "/api/state":
-            body = json.dumps(DATA).encode()
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-        if path == "/recoveryiq-mark.png":
-            body = (ROOT / "recoveryiq-mark.png").read_bytes()
-            self.send_response(200); self.send_header("Content-Type", "image/png"); self.send_header("Cache-Control", "no-cache"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
-        page = (ROOT / "index.html").read_text(encoding="utf-8")
-        page = page.replace("Batch intelligence · 08 payments", f"Batch intelligence · {len(DATA['transactions']):02d} payments")
-        body = page.encode("utf-8")
-        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+class OutcomeRequest(BaseModel):
+    payment_id: str
+    outcome: str
 
-    def do_POST(self):
-        global DATA
-        path = urlparse(self.path).path
-        if path == "/api/execute":
-            try:
-                size = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(size).decode("utf-8"))
-                payment_id = payload.get("payment_id")
-                mode = payload.get("mode", "sandbox")
-                idempotency_key = payload.get("idempotency_key")
-                if mode not in {"simulation", "sandbox"}:
-                    self.send_json({"error": "Only simulation and sandbox modes are enabled"}, 400); return
-                if not idempotency_key:
-                    self.send_json({"error": "idempotency_key is required"}, 400); return
-                row = next((r for r in DATA["transactions"] if r["id"] == payment_id), None)
-                if not row:
-                    self.send_json({"error": "Payment not found"}, 404); return
-                if row["policy"] != "ALLOWED":
-                    self.send_json({"error": "Policy blocked this action; route it to human review", "policy": row["policy"], "reason": row["policy_reason"]}, 409); return
-                result = PROVIDER.execute(row, row["action"], idempotency_key, mode)
-                row["execution_status"] = result["status"]
-                DATA["audit"].append({"timestamp": now(), "payment_id": payment_id, "event": "SANDBOX_EXECUTION", "action": row["action"], "policy": row["policy"], "reason": result["message"]})
-                save_state(DATA); self.send_json({"ok": True, "result": result})
-            except (ValueError, json.JSONDecodeError) as exc:
-                self.send_json({"error": f"Invalid execution payload: {exc}"}, 400)
-            return
-        if path == "/api/outcome":
-            try:
-                size = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(size).decode("utf-8"))
-                payment_id, outcome = payload.get("payment_id"), payload.get("outcome")
-                if outcome not in {"RECOVERED", "FAILED", "NOT_ATTEMPTED"}:
-                    self.send_json({"error": "Outcome must be RECOVERED, FAILED, or NOT_ATTEMPTED"}, 400); return
-                row = next((r for r in DATA["transactions"] if r["id"] == payment_id), None)
-                if not row:
-                    self.send_json({"error": "Payment not found"}, 404); return
-                row["outcome"] = outcome
-                DATA["audit"].append({"timestamp": now(), "payment_id": payment_id, "event": "OUTCOME_FEEDBACK", "action": row["action"], "policy": row["policy"], "reason": f"Outcome recorded: {outcome}"})
-                save_state(refresh_metrics(DATA)); self.send_json({"ok": True, "payment_id": payment_id, "metrics": DATA["metrics"]})
-            except (ValueError, json.JSONDecodeError) as exc:
-                self.send_json({"error": f"Invalid outcome payload: {exc}"}, 400)
-            return
-        if path == "/api/approval":
-            try:
-                size = int(self.headers.get("Content-Length", "0"))
-                payload = json.loads(self.rfile.read(size).decode("utf-8"))
-                payment_id = payload.get("payment_id")
-                row = next((r for r in DATA["transactions"] if r["id"] == payment_id), None)
-                if not row:
-                    self.send_json({"error": "Payment not found"}, 404); return
-                if row["policy"] != "BLOCKED":
-                    self.send_json({"error": "Only blocked decisions can enter human review"}, 409); return
-                row["review_status"] = "PENDING_HUMAN_REVIEW"
-                DATA["audit"].append({"timestamp": now(), "payment_id": payment_id, "event": "HUMAN_REVIEW_REQUESTED", "action": row["action"], "policy": row["policy"], "reason": payload.get("reason", "Blocked decision requires review")})
-                save_state(DATA); self.send_json({"ok": True, "payment_id": payment_id, "review_status": row["review_status"]})
-            except (ValueError, json.JSONDecodeError) as exc:
-                self.send_json({"error": f"Invalid approval payload: {exc}"}, 400)
-            return
-        if path != "/api/import":
-            self.send_json({"error": "Not found"}, 404); return
-        try:
-            size = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(size).decode("utf-8-sig")
-            records = list(csv.DictReader(io.StringIO(raw)))
-            required = {"id", "customer", "amount", "failure"}
-            missing = sorted(required - set(records[0].keys() if records else []))
-            if missing:
-                self.send_json({"error": "Missing required columns: " + ", ".join(missing)}, 400); return
-            transactions = []
-            for n, row in enumerate(records, 1):
-                transactions.append({"id": row["id"].strip(), "customer": row["customer"].strip(), "amount": int(float(row["amount"])), "currency": row.get("currency", "INR").strip() or "INR", "failure": row["failure"].strip().lower(), "retries": int(row.get("retries", 0) or 0), "days": int(row.get("days", 0) or 0), "email": row.get("email", "").strip()})
-            if not transactions:
-                self.send_json({"error": "CSV contains no payment rows"}, 400); return
-            DATA = evaluate(transactions)
-            save_state(DATA)
-            self.send_json({"ok": True, "rows": len(transactions), "metrics": DATA["metrics"]})
-        except (ValueError, KeyError) as exc:
-            self.send_json({"error": f"Invalid CSV value: {exc}"}, 400)
-        except OSError as exc:
-            self.send_json({"error": f"Could not save imported batch: {exc}"}, 500)
-    def log_message(self, *_):
-        pass
+class ApprovalRequest(BaseModel):
+    payment_id: str
+    reason: str = "Blocked decision requires review"
+
+app = FastAPI(title="RecoveryIQ API", version="0.1.0", description="Policy-aware revenue recovery control plane")
+
+
+@app.post("/api/reset")
+def reset_demo():
+    global DATA
+    DATA = evaluate(seed_transactions())
+    save_state(DATA)
+    return {"ok": True, "metrics": DATA["metrics"]}
+
+
+@app.post("/api/evaluate")
+def evaluate_batch():
+    global DATA
+    source = [{k: row[k] for k in ("id", "customer", "amount", "currency", "failure", "retries", "days", "email") if k in row} for row in DATA["transactions"]]
+    DATA = evaluate(source)
+    save_state(DATA)
+    return {"ok": True, "metrics": DATA["metrics"]}
+
+
+@app.get("/api/state")
+def get_state():
+    return DATA
+
+
+@app.get("/", response_class=HTMLResponse)
+def homepage():
+    page = (ROOT / "index.html").read_text(encoding="utf-8")
+    page = page.replace("Batch intelligence", f"Batch intelligence - {len(DATA['transactions']):02d} payments")
+    return HTMLResponse(page)
+
+
+@app.get("/recoveryiq-mark.png")
+def logo():
+    return FileResponse(ROOT / "recoveryiq-mark.png")
+
+
+@app.post("/api/execute")
+def execute_action(payload: ExecuteRequest):
+    if payload.mode not in {"simulation", "sandbox"}:
+        raise HTTPException(status_code=400, detail="Only simulation and sandbox modes are enabled")
+    row = next((r for r in DATA["transactions"] if r["id"] == payload.payment_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if row["policy"] != "ALLOWED":
+        raise HTTPException(status_code=409, detail="Policy blocked this action; route it to human review")
+    result = PROVIDER.execute(row, row["action"], payload.idempotency_key, payload.mode)
+    row["execution_status"] = result["status"]
+    DATA["audit"].append({"timestamp": now(), "payment_id": payload.payment_id, "event": "SANDBOX_EXECUTION", "action": row["action"], "policy": row["policy"], "reason": result["message"]})
+    save_state(DATA)
+    return {"ok": True, "result": result}
+
+
+@app.post("/api/outcome")
+def record_outcome(payload: OutcomeRequest):
+    if payload.outcome not in {"RECOVERED", "FAILED", "NOT_ATTEMPTED"}:
+        raise HTTPException(status_code=400, detail="Outcome must be RECOVERED, FAILED, or NOT_ATTEMPTED")
+    row = next((r for r in DATA["transactions"] if r["id"] == payload.payment_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    row["outcome"] = payload.outcome
+    DATA["audit"].append({"timestamp": now(), "payment_id": payload.payment_id, "event": "OUTCOME_FEEDBACK", "action": row["action"], "policy": row["policy"], "reason": f"Outcome recorded: {payload.outcome}"})
+    save_state(refresh_metrics(DATA))
+    return {"ok": True, "payment_id": payload.payment_id, "metrics": DATA["metrics"]}
+
+
+@app.post("/api/approval")
+def request_approval(payload: ApprovalRequest):
+    row = next((r for r in DATA["transactions"] if r["id"] == payload.payment_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if row["policy"] != "BLOCKED":
+        raise HTTPException(status_code=409, detail="Only blocked decisions can enter human review")
+    row["review_status"] = "PENDING_HUMAN_REVIEW"
+    DATA["audit"].append({"timestamp": now(), "payment_id": payload.payment_id, "event": "HUMAN_REVIEW_REQUESTED", "action": row["action"], "policy": row["policy"], "reason": payload.reason})
+    save_state(DATA)
+    return {"ok": True, "payment_id": payload.payment_id, "review_status": row["review_status"]}
+
+
+@app.post("/api/import")
+async def import_batch(file: UploadFile = File(...)):
+    global DATA
+    try:
+        raw = (await file.read()).decode("utf-8-sig")
+        records = list(csv.DictReader(io.StringIO(raw)))
+        required = {"id", "customer", "amount", "failure"}
+        missing = sorted(required - set(records[0].keys() if records else []))
+        if missing:
+            raise HTTPException(status_code=400, detail="Missing required columns: " + ", ".join(missing))
+        transactions = []
+        for row in records:
+            transactions.append({"id": row["id"].strip(), "customer": row["customer"].strip(), "amount": int(float(row["amount"])), "currency": row.get("currency", "INR").strip() or "INR", "failure": row["failure"].strip().lower(), "retries": int(row.get("retries", 0) or 0), "days": int(row.get("days", 0) or 0), "email": row.get("email", "").strip()})
+        if not transactions:
+            raise HTTPException(status_code=400, detail="CSV contains no payment rows")
+        DATA = evaluate(transactions)
+        save_state(DATA)
+        return {"ok": True, "rows": len(transactions), "metrics": DATA["metrics"]}
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV encoding: {exc}") from exc
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("localhost", 8000), Handler)
-    print("RecoveryIQ running at http://localhost:8000")
-    threading.Timer(0.5, lambda: webbrowser.open("http://localhost:8000")).start()
-    server.serve_forever()
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
