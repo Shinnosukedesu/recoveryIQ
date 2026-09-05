@@ -27,4 +27,4 @@ Use Reset demo before recording. This restores the deterministic seed batch.
 
 ## Positioning
 
-RecoveryIQ is a final-year AIML prototype for revenue recovery. It uses failure-based scoring to recommend an action, then applies deterministic rules before any simulated execution. It does not move real money.
+RecoveryIQ is a revenue recovery system for failed payments. It uses failure-based scoring to recommend an action, then applies deterministic rules before any simulated execution. It does not move real money.
